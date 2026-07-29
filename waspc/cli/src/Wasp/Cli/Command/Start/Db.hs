@@ -3,14 +3,19 @@ module Wasp.Cli.Command.Start.Db
   )
 where
 
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import qualified Control.Monad.Except as E
 import Control.Monad.IO.Class (liftIO)
+import Data.Char (toLower)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.List (isInfixOf)
 import Data.Maybe (isJust)
 import qualified Options.Applicative as Opt
 import StrongPath (Abs, Dir, File', Path', Rel, fromRelFile)
 import System.Environment (lookupEnv)
-import System.Process (callCommand)
+import System.Exit (ExitCode (..))
+import System.IO (BufferMode (LineBuffering), Handle, hGetLine, hIsEOF, hPutStrLn, hSetBuffering, stderr)
+import System.Process (CreateProcess (std_err), StdStream (CreatePipe), createProcess, proc, waitForProcess)
 import Text.Printf (printf)
 import qualified Wasp.AppSpec as AS
 import qualified Wasp.AppSpec.App.Db as AS.App.Db
@@ -29,7 +34,6 @@ import Wasp.Project.Common (WaspProjectDir)
 import Wasp.Project.Db (databaseUrlEnvVarName)
 import qualified Wasp.Project.Db.Dev.Postgres as Dev.Postgres
 import Wasp.Project.Env (dotEnvServer)
-import Wasp.Util (whenM)
 import Wasp.Util.Docker (DockerImageName, DockerVolumeMountPath)
 import qualified Wasp.Util.Network.Socket as Socket
 
@@ -122,60 +126,144 @@ startPostgresDevDb waspProjectDir appName dbDockerImage dbDockerVolumeMountPath 
   throwIfExeIsNotAvailable
     "docker"
     "To run PostgreSQL dev database, Wasp needs `docker` installed and in PATH."
-  throwIfDevDbPortIsAlreadyInUse
 
-  cliSendMessageC . Msg.Info $
-    unlines
-      [ "✨ Starting a PostgreSQL dev database (based on your Wasp config) ✨",
-        "",
-        "Additional info:",
-        " ℹ Using Docker image: " <> dbDockerImage,
-        "   with the data volume mounted at: " <> dbDockerVolumeMountPath,
-        " ℹ Connection URL, in case you might want to connect with external tools:",
-        "     " <> connectionUrl,
-        " ℹ Database data is persisted in a Docker volume with the following name"
-          <> " (useful to know if you will want to delete it at some point):",
-        "     " <> dockerVolumeName
-      ]
-
-  cliSendMessageC $ Msg.Info "..."
-
-  -- NOTE: POSTGRES_PASSWORD, POSTGRES_USER, POSTGRES_DB below are really used by the docker image
-  --   only when initializing the database -> if it already exists, they will be ignored.
-  --   This is how the postgres Docker image works.
-  let command =
-        unwords
-          [ "docker run",
-            printf "--name %s" dockerContainerName,
-            "--rm",
-            printf "--publish %d:5432" Dev.Postgres.defaultDevPort,
-            printf "-v %s:%s" dockerVolumeName dbDockerVolumeMountPath,
-            printf "--env POSTGRES_PASSWORD=%s" Dev.Postgres.defaultDevPass,
-            printf "--env POSTGRES_USER=%s" Dev.Postgres.defaultDevUser,
-            printf "--env POSTGRES_DB=%s" dbName,
-            dbDockerImage
-          ]
-  liftIO $ callCommand command
+  maybeAlreadyRunningPort <- liftIO $ Dev.Postgres.discoverDevDbPort waspProjectDir appName
+  case maybeAlreadyRunningPort of
+    Just port -> noteDbIsAlreadyRunning port
+    Nothing -> startOnFirstFreePort candidatePorts
   where
-    dockerVolumeName = Dev.Postgres.makeWaspDevDbDockerVolumeName waspProjectDir appName
-    dockerContainerName = Dev.Postgres.makeWaspDevDbDockerContainerName waspProjectDir appName
-    dbName = Dev.Postgres.makeDevDbName waspProjectDir appName
-    connectionUrl = Dev.Postgres.makeDevConnectionUrl waspProjectDir appName
+    -- We scan sequentially from the default port so that behavior is predictable:
+    -- a lone Wasp app on a machine with a free 5432 always gets 5432.
+    candidatePorts = take numOfPortsToScan [Dev.Postgres.defaultDevPort ..]
+    numOfPortsToScan = 20
 
-    throwIfDevDbPortIsAlreadyInUse :: Command ()
-    throwIfDevDbPortIsAlreadyInUse = do
+    noteDbIsAlreadyRunning :: Int -> Command ()
+    noteDbIsAlreadyRunning port =
+      cliSendMessageC . Msg.Info $
+        unlines
+          [ printf "Your dev database is already running on port %d." port,
+            "Connection URL, in case you might want to connect with external tools:",
+            "  " <> Dev.Postgres.makeDevConnectionUrl waspProjectDir appName port
+          ]
+
+    startOnFirstFreePort :: [Int] -> Command ()
+    startOnFirstFreePort [] = throwNoFreePortError
+    startOnFirstFreePort (port : remainingPorts) = do
+      portIsBusy <- liftIO $ checkIfPortIsBusy port
+      if portIsBusy
+        then do
+          cliSendMessageC . Msg.Info $ printf "Port %d is busy, trying the next one." port
+          startOnFirstFreePort remainingPorts
+        else do
+          printStartingDbInfo port
+          runResult <- liftIO $ runDbDockerContainer port
+          case runResult of
+            -- Between our port check and docker binding the port, somebody else
+            -- (e.g. another Wasp project starting in parallel) might have taken it.
+            -- Docker's port bind is the final arbiter, so on that specific failure
+            -- we just move on to the next port.
+            DbRunFailedPortTaken -> do
+              cliSendMessageC . Msg.Info $
+                printf "Port %d got taken in the meantime, trying the next one." port
+              startOnFirstFreePort remainingPorts
+            DbRunExited ExitSuccess -> return ()
+            DbRunExited (ExitFailure exitCode) ->
+              E.throwError $
+                CommandError "Dev database failed" $
+                  printf "Running the dev database Docker container failed with exit code %d." exitCode
+
+    checkIfPortIsBusy :: Int -> IO Bool
+    checkIfPortIsBusy port = do
       -- I am checking both conditions because of Docker having virtual network on Mac which
       -- always gives precedence to native ports so checking only if we can open the port is
       -- not enough because we can open it even if Docker container is already bound to that port.
-      whenM (liftIO $ Socket.checkIfPortIsInUse devDbSocketAddress) throwPortAlreadyInUseError
-      whenM (liftIO $ Socket.checkIfPortIsAcceptingConnections devDbSocketAddress) throwPortAlreadyInUseError
+      portIsInUse <- Socket.checkIfPortIsInUse socketAddress
+      if portIsInUse
+        then return True
+        else Socket.checkIfPortIsAcceptingConnections socketAddress
       where
-        devDbSocketAddress = Socket.makeLocalHostSocketAddress $ fromIntegral Dev.Postgres.defaultDevPort
-        throwPortAlreadyInUseError =
-          E.throwError $
-            CommandError
-              "Port already in use"
-              ( printf
-                  "Wasp can't run PostgreSQL dev database for you since port %d is already in use."
-                  Dev.Postgres.defaultDevPort
-              )
+        socketAddress = Socket.makeLocalHostSocketAddress $ fromIntegral port
+
+    runDbDockerContainer :: Int -> IO DbRunResult
+    runDbDockerContainer port = do
+      (_, _, Just dockerStderr, dockerProcess) <-
+        createProcess (proc "docker" (dockerRunArgs port)) {std_err = CreatePipe}
+      sawPortAllocatedErrorRef <- newIORef False
+      relayLinesAndDetectPortAllocatedError dockerStderr sawPortAllocatedErrorRef
+      exitCode <- waitForProcess dockerProcess
+      sawPortAllocatedError <- readIORef sawPortAllocatedErrorRef
+      return $
+        if sawPortAllocatedError && exitCode /= ExitSuccess
+          then DbRunFailedPortTaken
+          else DbRunExited exitCode
+
+    relayLinesAndDetectPortAllocatedError :: Handle -> IORef Bool -> IO ()
+    relayLinesAndDetectPortAllocatedError dockerStderr sawPortAllocatedErrorRef = do
+      hSetBuffering dockerStderr LineBuffering
+      relayLines
+      where
+        relayLines = do
+          isEof <- hIsEOF dockerStderr
+          unless isEof $ do
+            line <- hGetLine dockerStderr
+            hPutStrLn stderr line
+            when (isPortAllocatedError line) $ writeIORef sawPortAllocatedErrorRef True
+            relayLines
+
+        isPortAllocatedError line = "port is already allocated" `isInfixOf` map toLower line
+
+    -- NOTE: POSTGRES_PASSWORD, POSTGRES_USER, POSTGRES_DB below are really used by the docker image
+    --   only when initializing the database -> if it already exists, they will be ignored.
+    --   This is how the postgres Docker image works.
+    dockerRunArgs :: Int -> [String]
+    dockerRunArgs port =
+      [ "run",
+        "--name",
+        dockerContainerName,
+        "--rm",
+        "--publish",
+        printf "%d:5432" port,
+        "--volume",
+        dockerVolumeName <> ":" <> dbDockerVolumeMountPath,
+        "--env",
+        "POSTGRES_PASSWORD=" <> Dev.Postgres.defaultDevPass,
+        "--env",
+        "POSTGRES_USER=" <> Dev.Postgres.defaultDevUser,
+        "--env",
+        "POSTGRES_DB=" <> dbName,
+        dbDockerImage
+      ]
+
+    printStartingDbInfo :: Int -> Command ()
+    printStartingDbInfo port = do
+      cliSendMessageC . Msg.Info $
+        unlines
+          [ "✨ Starting a PostgreSQL dev database (based on your Wasp config) ✨",
+            "",
+            "Additional info:",
+            " ℹ Using Docker image: " <> dbDockerImage,
+            "   with the data volume mounted at: " <> dbDockerVolumeMountPath,
+            " ℹ Connection URL, in case you might want to connect with external tools:",
+            "     " <> Dev.Postgres.makeDevConnectionUrl waspProjectDir appName port,
+            " ℹ Database data is persisted in a Docker volume with the following name"
+              <> " (useful to know if you will want to delete it at some point):",
+            "     " <> dockerVolumeName
+          ]
+      cliSendMessageC $ Msg.Info "..."
+
+    throwNoFreePortError :: Command ()
+    throwNoFreePortError =
+      E.throwError $
+        CommandError
+          "No free port"
+          ( printf
+              "Wasp can't run PostgreSQL dev database for you since all ports from %d to %d are already in use."
+              Dev.Postgres.defaultDevPort
+              (Dev.Postgres.defaultDevPort + numOfPortsToScan - 1)
+          )
+
+    dockerVolumeName = Dev.Postgres.makeWaspDevDbDockerVolumeName waspProjectDir appName
+    dockerContainerName = Dev.Postgres.makeWaspDevDbDockerContainerName waspProjectDir appName
+    dbName = Dev.Postgres.makeDevDbName waspProjectDir appName
+
+data DbRunResult = DbRunFailedPortTaken | DbRunExited ExitCode

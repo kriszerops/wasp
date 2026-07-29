@@ -1,6 +1,7 @@
 -- | This module captures how Wasp runs a PostgreSQL dev database.
 module Wasp.Project.Db.Dev.Postgres
   ( discoverDevConnectionUrl,
+    discoverDevDbPort,
     defaultDevUser,
     makeDevDbName,
     defaultDevPass,
@@ -33,7 +34,7 @@ import Wasp.Project.Common (WaspProjectDir, makeAppUniqueId)
 discoverDevConnectionUrl :: Path' Abs (Dir WaspProjectDir) -> String -> IO String
 discoverDevConnectionUrl waspProjectDir appName = do
   devDbPort <- fromMaybe defaultDevPort <$> discoverDevDbPort waspProjectDir appName
-  return $ makeConnectionUrl defaultDevUser defaultDevPass devDbPort $ makeDevDbName waspProjectDir appName
+  return $ makeDevConnectionUrl waspProjectDir appName devDbPort
 
 -- | Asks Docker for the host port on which this Wasp project's dev db container
 -- is currently published. Returns Nothing if the container is not running or
@@ -76,9 +77,9 @@ makeDevDbName waspProjectDir appName =
 defaultDevPort :: Int
 defaultDevPort = 5432 -- 5432 is default port for PostgreSQL db.
 
-makeDevConnectionUrl :: Path' Abs (Dir WaspProjectDir) -> String -> String
-makeDevConnectionUrl waspProjectDir appName =
-  makeConnectionUrl defaultDevUser defaultDevPass defaultDevPort $ makeDevDbName waspProjectDir appName
+makeDevConnectionUrl :: Path' Abs (Dir WaspProjectDir) -> String -> Int -> String
+makeDevConnectionUrl waspProjectDir appName port =
+  makeConnectionUrl defaultDevUser defaultDevPass port $ makeDevDbName waspProjectDir appName
 
 -- | Docker volume name unique for the Wasp project with specified path and name.
 makeWaspDevDbDockerVolumeName :: Path' Abs (Dir WaspProjectDir) -> String -> String
