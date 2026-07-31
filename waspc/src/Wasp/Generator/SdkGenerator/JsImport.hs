@@ -38,10 +38,8 @@ extImportToJsImport extImport@(EI.ExtImport extImportName extImportSource _) =
       _importAlias = Just $ getAliasedExtImportIdentifier extImport
     }
   where
-    importPath = case extImportSource of
-      EI.ProjectSrcExtImportSource projectSrcPath ->
-        ModuleImportPath $ makeSdkImportPath $ dropExtensionFromImportPath $ extCodeDirP </> castRel projectSrcPath
-      EI.PackageExtImportSource packageImportSource ->
-        RawImportName $ EI.packageImportSourceToImportSpecifier packageImportSource
+    importPath = GJI.extImportSourceToJsImportPath projectSrcPathToJsImportPath extImportSource
+    projectSrcPathToJsImportPath projectSrcPath =
+      ModuleImportPath $ makeSdkImportPath $ dropExtensionFromImportPath $ extCodeDirP </> castRel projectSrcPath
     extCodeDirP = fromJust $ relDirToPosix extSrcDirInSdkRootDir
     importName = GJI.extImportNameToJsImportName extImportName
